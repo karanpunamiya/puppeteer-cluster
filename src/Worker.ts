@@ -25,13 +25,16 @@ export interface WorkError {
     type: 'error';
     error: Error;
 }
-
 export interface WorkData {
     type: 'success';
     data: any;
 }
 
-export type WorkResult = WorkError | WorkData;
+export interface RestartWorker {
+    type: 'restart';
+}
+
+export type WorkResult = WorkError | WorkData | RestartWorker;
 
 export default class Worker<JobData, ReturnData> implements WorkerOptions {
 
@@ -39,6 +42,7 @@ export default class Worker<JobData, ReturnData> implements WorkerOptions {
     args: string[];
     id: number;
     browser: WorkerInstance;
+    times: number;
 
     activeTarget: Job<JobData, ReturnData> | null = null;
 
@@ -47,6 +51,7 @@ export default class Worker<JobData, ReturnData> implements WorkerOptions {
         this.args = args;
         this.id = id;
         this.browser = browser;
+        this.times = 0;
 
         debug(`Starting #${this.id}`);
     }
@@ -72,7 +77,9 @@ export default class Worker<JobData, ReturnData> implements WorkerOptions {
                 await this.browser.repair();
                 tries += 1;
                 if (tries >= BROWSER_INSTANCE_TRIES) {
-                    throw new Error('Unable to get browser page');
+                    return {
+                        type: 'restart',
+                    };
                 }
             }
         }

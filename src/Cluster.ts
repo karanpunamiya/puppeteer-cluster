@@ -1,4 +1,3 @@
-
 import Job, { ExecuteResolve, ExecuteReject, ExecuteCallbacks } from './Job';
 import Display from './Display';
 import * as util from './util';
@@ -8,19 +7,28 @@ import * as builtInConcurrency from './concurrency/builtInConcurrency';
 
 import { LaunchOptions, Page } from 'puppeteer';
 import Queue from './Queue';
+import SetTTL from './SetTTL';
 import SystemMonitor from './SystemMonitor';
 import { EventEmitter } from 'events';
 import ConcurrencyImplementation, { WorkerInstance, ConcurrencyImplementationClassType }
     from './concurrency/ConcurrencyImplementation';
+import { Mutex } from 'async-mutex';
 
 const debug = util.debugGenerator('Cluster');
+const workerStartingMutex: Mutex = new Mutex();
+const workerIdMutex: Mutex = new Mutex();
+export const constants = {
+    addingDelayedItemEvent: 'Adding Delayed Item',
+    removingDelayedItemEvent: 'Removing Delayed Item',
+};
 
 interface ClusterOptions {
+    skipDuplicateUrlsTTL?: number;
     concurrency: number | ConcurrencyImplementationClassType;
     maxConcurrency: number;
     workerCreationDelay: number;
     puppeteerOptions: LaunchOptions;
-    perBrowserOptions: LaunchOptions[] | undefined;
+    perBrowserOptions: any;
     monitor: boolean;
     timeout: number;
     retryLimit: number;
@@ -28,6 +36,7 @@ interface ClusterOptions {
     skipDuplicateUrls: boolean;
     sameDomainDelay: number;
     puppeteer: any;
+    urlsPerBrowser: number;
 }
 
 type Partial<T> = {
@@ -43,7 +52,7 @@ const DEFAULT_OPTIONS: ClusterOptions = {
     puppeteerOptions: {
         // headless: false, // just for testing...
     },
-    perBrowserOptions: undefined,
+    perBrowserOptions: [],
     monitor: false,
     timeout: 30 * 1000,
     retryLimit: 0,
@@ -51,6 +60,7 @@ const DEFAULT_OPTIONS: ClusterOptions = {
     skipDuplicateUrls: false,
     sameDomainDelay: 0,
     puppeteer: undefined,
+    urlsPerBrowser: 10000,
 };
 
 interface TaskFunctionArguments<JobData> {
@@ -65,9 +75,10 @@ export type TaskFunction<JobData, ReturnData> = (
     arg: TaskFunctionArguments<JobData>,
 ) => Promise<ReturnData>;
 
-const MONITORING_DISPLAY_INTERVAL = 500;
+const MONITORING_DISPLAY_INTERVAL = 5000;
 const CHECK_FOR_WORK_INTERVAL = 100;
 const WORK_CALL_INTERVAL_LIMIT = 10;
+export const domainDelayMap: Map<string, number> = new Map<string, number>();
 
 export default class Cluster<JobData = any, ReturnData = any> extends EventEmitter {
 
@@ -76,19 +87,21 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
     static CONCURRENCY_BROWSER = 3; // no cookie sharing and individual processes (uses contexts)
 
     private options: ClusterOptions;
-    private perBrowserOptions: LaunchOptions[] | null = null;
     private workers: Worker<JobData, ReturnData>[] = [];
     private workersAvail: Worker<JobData, ReturnData>[] = [];
     private workersBusy: Worker<JobData, ReturnData>[] = [];
     private workersStarting = 0;
-
+    private perBrowserOptions: any;
+    private usePerBrowserOptions: boolean = false;
+    private urlsPerBrowser = 10000;
     private allTargetCount = 0;
     private jobQueue: Queue<Job<JobData, ReturnData>> = new Queue<Job<JobData, ReturnData>>();
+    private duplicateUrlsSetTTL: SetTTL<string> = new SetTTL<string>();
     private errorCount = 0;
 
     private taskFunction: TaskFunction<JobData, ReturnData> | null = null;
     private idleResolvers: (() => void)[] = [];
-    private waitForOneResolvers: ((data:JobData) => void)[] = [];
+    private waitForOneResolvers: ((data: JobData) => void)[] = [];
     private browser: ConcurrencyImplementation | null = null;
 
     private isClosed = false;
@@ -115,7 +128,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
 
     private constructor(options: ClusterOptionsArgument) {
         super();
-
+        // this.domainDelayMapInit();
         this.options = {
             ...DEFAULT_OPTIONS,
             ...options,
@@ -144,22 +157,16 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         } else if (this.options.concurrency === Cluster.CONCURRENCY_CONTEXT) {
             this.browser = new builtInConcurrency.Context(browserOptions, puppeteer);
         } else if (this.options.concurrency === Cluster.CONCURRENCY_BROWSER) {
+            this.perBrowserOptions = this.options.perBrowserOptions;
+            if (this.perBrowserOptions.length > 0) {
+                this.usePerBrowserOptions = true;
+            }
+            this.urlsPerBrowser = this.options.urlsPerBrowser;
             this.browser = new builtInConcurrency.Browser(browserOptions, puppeteer);
         } else if (typeof this.options.concurrency === 'function') {
             this.browser = new this.options.concurrency(browserOptions, puppeteer);
         } else {
             throw new Error(`Unknown concurrency option: ${this.options.concurrency}`);
-        }
-
-        if (typeof this.options.maxConcurrency !== 'number') {
-            throw new Error('maxConcurrency must be of number type');
-        }
-        if (this.options.perBrowserOptions
-            && this.options.perBrowserOptions.length !== this.options.maxConcurrency) {
-            throw new Error('perBrowserOptions length must equal maxConcurrency');
-        }
-        if (this.options.perBrowserOptions) {
-            this.perBrowserOptions = [...this.options.perBrowserOptions];
         }
 
         try {
@@ -179,22 +186,29 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
 
     private async launchWorker() {
         // signal, that we are starting a worker
-        this.workersStarting += 1;
-        this.nextWorkerId += 1;
+        await workerStartingMutex.runExclusive(() => {
+            this.workersStarting += 1;
+        });
+        await workerIdMutex.runExclusive(() => {
+            this.nextWorkerId += 1;
+        });
         this.lastLaunchedWorkerTime = Date.now();
-
-        let nextWorkerOption;
-        if (this.perBrowserOptions && this.perBrowserOptions.length > 0) {
-            nextWorkerOption = this.perBrowserOptions.shift();
+        let nextBrowserOption = {};
+        if (this.usePerBrowserOptions && this.perBrowserOptions.length > 0) {
+            // tslint:disable-next-line:max-line-length
+            nextBrowserOption = this.perBrowserOptions[Math.floor(Math.random() * this.perBrowserOptions.length)];
         }
-
         const workerId = this.nextWorkerId;
 
         let workerBrowserInstance: WorkerInstance;
         try {
             workerBrowserInstance = await (this.browser as ConcurrencyImplementation)
-                .workerInstance(nextWorkerOption);
+                .workerInstance(nextBrowserOption);
         } catch (err) {
+            await workerStartingMutex.runExclusive(() => {
+                this.workersStarting -= 1;
+            });
+            console.log(`Unable to launch browser for worker, error message: ${err.message}`);
             throw new Error(`Unable to launch browser for worker, error message: ${err.message}`);
         }
 
@@ -204,7 +218,10 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
             browser: workerBrowserInstance,
             id: workerId,
         });
-        this.workersStarting -= 1;
+
+        await workerStartingMutex.runExclusive(() => {
+            this.workersStarting -= 1;
+        });
 
         if (this.isClosed) {
             // cluster was closed while we created a new worker (should rarely happen)
@@ -220,7 +237,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
     }
 
     private nextWorkCall: number = 0;
-    private workCallTimeout: NodeJS.Timer|null = null;
+    private workCallTimeout: NodeJS.Timer | null = null;
 
     // check for new work soon (wait if there will be put more data into the queue, first)
     private async work() {
@@ -262,20 +279,49 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         }
 
         const job = this.jobQueue.shift();
-
-        if (job === undefined) {
+        if (typeof job === 'undefined' || job === null) {
             // skip, there are items in the queue but they are all delayed
             return;
         }
+        // @ts-ignore
+        const ugd: string = job && job.data && job.data.ugd ? job.data.ugd : undefined;
+
+        const currentDomains = this.workersBusy.map((working) => {
+            try {
+                if (working.activeTarget) {
+                    // TODO: improve the logic, hardcoding to get things working
+                    const data: any = working.activeTarget.data || { url: '' };
+                    return util.getDomainFromURL(data.url || '');
+                }
+            } catch (e) {
+            }
+            return undefined;
+        });
 
         const url = job.getUrl();
         const domain = job.getDomain();
+        const currentTLDDomain = util.getDomainFromURL(url);
+
+        if (currentDomains.includes(currentTLDDomain)) {
+            this.jobQueue.push(job);
+            this.work();
+            return;
+        }
 
         // Check if URL was already crawled (on skipDuplicateUrls)
         if (this.options.skipDuplicateUrls
             && url !== undefined && this.duplicateCheckUrls.has(url)) {
             // already crawled, just ignore
             debug(`Skipping duplicate URL: ${job.getUrl()}`);
+            console.log(`Skipping duplicate URL: ${job.getUrl()}`);
+            this.work();
+            return;
+        }
+
+        if (this.options.skipDuplicateUrlsTTL
+            && url !== undefined && this.duplicateUrlsSetTTL.isExists(url + ugd)) {
+            debug(`Skipping duplicate URL: ${job.getUrl()}`);
+            console.log(`Skipping duplicate URLs TTL: ${job.getUrl()}`);
             this.work();
             return;
         }
@@ -288,6 +334,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
                 this.jobQueue.push(job, {
                     delayUntil: lastDomainAccess + this.options.sameDomainDelay,
                 });
+                console.log('Same Domain Delay: ', domain);
                 this.work();
                 return;
             }
@@ -297,6 +344,11 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         if (this.options.skipDuplicateUrls && url !== undefined) {
             this.duplicateCheckUrls.add(url);
         }
+
+        if (this.options.skipDuplicateUrlsTTL && url !== undefined && ugd !== undefined) {
+            this.duplicateUrlsSetTTL.add(url + ugd, this.options.skipDuplicateUrlsTTL);
+        }
+
         if (this.options.sameDomainDelay !== 0 && domain !== undefined) {
             this.lastDomainAccesses.set(domain, Date.now());
         }
@@ -317,12 +369,23 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         } else {
             throw new Error('No task function defined!');
         }
-
+        // tslint:disable-next-line:no-increment-decrement
+        worker.times++;
         const result: WorkResult = await worker.handle(
-            (jobFunction as TaskFunction<JobData, ReturnData>),
-            job,
-            this.options.timeout,
-        );
+                (jobFunction as TaskFunction<JobData, ReturnData>),
+                job,
+                this.options.timeout,
+            );
+        if (result.type === 'restart') {
+            const busyWorkerIndex = this.workersBusy.indexOf(worker);
+            this.workersBusy.splice(busyWorkerIndex, 1);
+            const workerIndex = this.workers.indexOf(worker);
+            this.workers.splice(workerIndex, 1);
+            await worker.close();
+            await this.launchWorker();
+            this.work();
+            return;
+        }
 
         if (result.type === 'error') {
             if (job.executeCallbacks) {
@@ -354,8 +417,18 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         this.waitForOneResolvers = [];
 
         // add worker to available workers again
-        const workerIndex = this.workersBusy.indexOf(worker);
-        this.workersBusy.splice(workerIndex, 1);
+        const busyWorkerIndex = this.workersBusy.indexOf(worker);
+        this.workersBusy.splice(busyWorkerIndex, 1);
+
+        if (worker.times > this.urlsPerBrowser) {
+            console.log('Reached Maximum URLs Per Browser');
+            const workerIndex = this.workers.indexOf(worker);
+            this.workers.splice(workerIndex, 1);
+            await worker.close();
+            await this.launchWorker();
+            this.work();
+            return;
+        }
 
         this.workersAvail.push(worker);
 
@@ -379,7 +452,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
     // Type Guard for TypeScript
     private isTaskFunction(
         data: JobData | TaskFunction<JobData, ReturnData>,
-    ) : data is TaskFunction<JobData, ReturnData> {
+    ): data is TaskFunction<JobData, ReturnData> {
         return (typeof data === 'function');
     }
 
@@ -440,7 +513,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
     }
 
     public waitForOne(): Promise<JobData> {
-        return new Promise(resolve  => this.waitForOneResolvers.push(resolve));
+        return new Promise(resolve => this.waitForOneResolvers.push(resolve));
     }
 
     public async close(): Promise<void> {
@@ -506,12 +579,17 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         display.log(`== Start:     ${util.formatDateTime(this.startTime)}`);
         display.log(`== Now:       ${util.formatDateTime(now)} (running for ${timeRunning})`);
         display.log(`== Progress:  ${doneTargets} / ${this.allTargetCount} (${donePercStr}%)`
-            + `, errors: ${this.errorCount} (${errorPerc}%)`);
+                        + `, errors: ${this.errorCount} (${errorPerc}%)`);
         display.log(`== Remaining: ${timeRemining} (@ ${pagesPerSecond} pages/second)`);
         display.log(`== Sys. load: ${cpuUsage}% CPU / ${memoryUsage}% memory`);
         display.log(`== Workers:   ${this.workers.length + this.workersStarting}`);
-
+        display.log(`== Job Queue Length:   ${this.jobQueue.size()}`);
+        display.log(`== Job Queue Delay Items Length:   ${this.jobQueue.delayedItemSize()}`);
+        display.log(`== Job Queue Items to be picked:   ${this.jobQueue.currentJobsToBePicked()}`);
+        display.log(`== Avail Workers Length:   ${this.workersAvail.length}`);
+        display.log(`== Busy Workers Length:   ${this.workersBusy.length}`);
         this.workers.forEach((worker, i) => {
+            // @ts-ignore
             const isIdle = this.workersAvail.indexOf(worker) !== -1;
             let workOrIdle;
             let workerUrl = '';
@@ -519,6 +597,7 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
                 workOrIdle = 'IDLE';
             } else {
                 workOrIdle = 'WORK';
+
                 if (worker.activeTarget) {
                     workerUrl = worker.activeTarget.getUrl() || 'UNKNOWN TARGET';
                 } else {
@@ -531,7 +610,14 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         for (let i = 0; i < this.workersStarting; i += 1) {
             display.log(`   #${this.workers.length + i} STARTING...`);
         }
-
+        let i = 0;
+        display.log('== Domain Delay Map :');
+        domainDelayMap.forEach((val, key) => {
+            if (val > 0) {
+                i += 1;
+                display.log(` #${i} ${key} : ${val}`);
+            }
+        });
         display.resetCursor();
     }
 
