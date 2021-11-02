@@ -1,5 +1,6 @@
 
 import * as Debug from 'debug';
+import * as TLD from 'tldjs';
 
 interface TimeUnit {
     step: number;
@@ -96,4 +97,12 @@ logToConsole.log = console.error.bind(console);
 
 export function log(msg: string): void {
     logToConsole(msg);
+}
+
+export function getDomainFromURL(url: any) {
+    try {
+        return TLD.getDomain(url);
+    } catch (e) {
+    }
+    return undefined;
 }
