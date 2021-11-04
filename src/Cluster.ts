@@ -621,4 +621,8 @@ export default class Cluster<JobData = any, ReturnData = any> extends EventEmitt
         display.resetCursor();
     }
 
+    public queueLength(): number {
+        return this.jobQueue.size();
+    }
+
 }
